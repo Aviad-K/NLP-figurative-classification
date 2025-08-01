@@ -1,0 +1,12 @@
+{
+  "extraction_info": {
+    "model_name": "bert-base-uncased",
+    "device_used": "cuda",
+    "timestamp": "20250728_151711",
+    "train_samples": 160154,
+    "test_samples": 22196,
+    "embedding_dimension": 768,
+    "total_filtered_train": 160154,
+    "total_filtered_test": 22196
+  }
+}
