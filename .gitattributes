@@ -1,3 +1,5 @@
+*.joblib filter=lfs diff=lfs merge=lfs -text
+*.npz filter=lfs diff=lfs merge=lfs -text
 baseline_models/random_forest_pos.joblib filter=lfs diff=lfs merge=lfs -text
 baseline_models/random_forest_pos_and_embeddings.joblib filter=lfs diff=lfs merge=lfs -text
 bert_embeddings/bert_embeddings.npz filter=lfs diff=lfs merge=lfs -text
