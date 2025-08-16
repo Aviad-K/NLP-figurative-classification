@@ -17,7 +17,7 @@ def objective(trial):
     # --- Define Hyperparameter Search Space ---
     
     # 1. Categorical parameters
-    per_device_train_batch_size = 32
+    per_device_train_batch_size = 128
     n_splits = 5
     
     # 2. Integer parameters - Range adjusted based on previous run.
@@ -25,7 +25,7 @@ def objective(trial):
     fgpos_embedding_dim = trial.suggest_int("fgpos_embedding_dim", 0, 8)
     
     # 3. Float parameters (log scale) - Range adjusted based on previous run.
-    learning_rate = trial.suggest_float("learning_rate", 1e-5, 5e-5, log=True)
+    learning_rate = trial.suggest_float("learning_rate", 1e-5, 0.01, log=True)
     
     # 4. Float parameters (uniform scale)
     weight_decay = trial.suggest_float("weight_decay", 0.0, 0.3)
@@ -42,7 +42,7 @@ def objective(trial):
     python_executable = sys.executable
 
     # The base model to fine-tune.
-    model_name = "roberta-large"
+    model_name = "roberta-base"
     print(f"Starting from base model: '{model_name}'.")
 
     command = [

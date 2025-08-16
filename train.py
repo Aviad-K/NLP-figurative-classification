@@ -145,41 +145,62 @@ class WeightedLossTrainer(Trainer):
 # --- Helper Functions ---
 
 def load_and_group_data_pandas(json_path):
-        """
-        Loads and processes data using pandas for high performance.
-        Reads the entire jsonl file into a pandas DataFrame, then groups by 
-        sentence and aggregates the data, which is much faster than iterating line-by-line.
-        """
-        df = pd.read_json(json_path, lines=True, encoding='utf-8')
-        
-        # Sort values first to ensure lists are aggregated in the correct order
-        df_sorted = df.sort_values(by=['sentence', 'w_index'])
-        
-        # Group by sentence and aggregate the data into lists
-        grouped = df_sorted.groupby('sentence', sort=False).agg({
-            'w_index': list,
-            'label': list,
-            'POS': list,
-            'FGPOS': list
-        }).reset_index()
+    """
+    Loads and processes data using pandas.
+    IMPORTANT: We separate *occurrences* of identical sentence strings so they don't get merged.
+    Output keys and formats are identical to your original function.
+    """
+    df = pd.read_json(json_path, lines=True, encoding='utf-8')
 
-        grouped_data = []
-        for _, row in grouped.iterrows():
-            original_words = row['sentence'].split(' ')
-            # The lists are already sorted because we sorted the DataFrame before grouping
-            try:
-                words_for_model = [original_words[i] for i in row['w_index']]
-                
-                grouped_data.append({
-                    "sentence_words": words_for_model,
-                    "labels": row['label'],
-                    "pos_tags": row['POS'],
-                    "fgpos_tags": row['FGPOS'],
-                })
-            except IndexError:
-                print(f"Skipping problematic sentence due to w_index mismatch: {row['sentence']}")
-                continue
-        return grouped_data
+    # Sanity: require the columns your pipeline already uses
+    required = ["sentence", "w_index", "label", "POS", "FGPOS"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns in {json_path}: {missing}")
+
+    # Preserve original file order and create a per-sentence occurrence id.
+    df = df.reset_index(drop=True)
+    df["_row"] = np.arange(len(df))
+
+    # Sort to keep tokens in order per sentence and preserve file order across repeats
+    df_sorted = df.sort_values(by=["sentence", "_row", "w_index"])
+
+    # New: split identical sentence strings into separate occurrences
+    # Start of a sentence occurrence is marked by w_index == 0
+    df_sorted["_is_start"] = (df_sorted["w_index"] == 0).astype(int)
+    # Occurrence id: cumulative count of starts within each sentence string
+    df_sorted["_occ"] = df_sorted.groupby("sentence")["_is_start"].cumsum() - 1
+
+    # Group by (sentence, occurrence), not just sentence
+    grouped = df_sorted.groupby(["sentence", "_occ"], sort=False).agg({
+        "w_index": list,
+        "label": list,
+        "POS": list,
+        "FGPOS": list
+    }).reset_index()
+
+    grouped_data = []
+    for _, row in grouped.iterrows():
+        # Reconstruct tokens exactly as your original code did
+        original_words = row["sentence"].split(' ')
+        try:
+            words_for_model = [original_words[i] for i in row["w_index"]]
+        except IndexError:
+            # Guard against any stray bad index; skip that bad sentence cleanly
+            print(f"Skipping problematic sentence due to w_index mismatch: {row['sentence']}")
+            continue
+
+        grouped_data.append({
+            "sentence_words": words_for_model,   # list[str]
+            "labels": row["label"],              # list[int]
+            "pos_tags": row["POS"],              # list[str]
+            "fgpos_tags": row["FGPOS"],          # list[str]
+            # Keep the exact original sentence string for clean CSVs
+            "original_sentence": row["sentence"]
+        })
+
+    return grouped_data
+
 
 def tokenize_and_align_labels(examples, tokenizer, pos2id, fgpos2id):
         """
@@ -406,52 +427,64 @@ def train_and_evaluate(args, train_dataset, eval_dataset, model_name, data_colla
 # --- Error Analysis Function ---
 def generate_error_analysis_file(original_test_data, tokenized_test_dataset, final_predictions, output_file):
     """
-    Generates a CSV file for error analysis, comparing model predictions to true labels.
+    Generates a CSV for error analysis with sentence-aligned predictions.
+    Uses original_sentence (exact string from the dataset) for the CSV.
     """
     print(f"Generating error analysis file at: {output_file}")
-    
+
     analysis_records = []
-    
-    # Create a mask to filter out padding/special tokens from the predictions
-    labels_mask = np.array(tokenized_test_dataset['labels']) != -100
-    # Apply the mask to get a flat list of predictions for the actual words
-    predictions_flat = final_predictions[labels_mask]
 
-    # This index will keep track of our position in the flat predictions list
-    prediction_idx = 0
-    
-    # Iterate through the original test data, which is a list of sentences
-    for sentence_data in original_test_data:
-        full_sentence = " ".join(sentence_data["sentence_words"])
-        
-        # Iterate through the words and labels of the current sentence
-        for i, word in enumerate(sentence_data["sentence_words"]):
-            # Ensure we don't go out of bounds
-            if prediction_idx < len(predictions_flat):
-                true_label = sentence_data["labels"][i]
-                predicted_label = predictions_flat[prediction_idx]
-                
-                error_type = "Correct"
-                if predicted_label != true_label:
-                    error_type = "False Positive" if predicted_label == 1 else "False Negative"
-                
-                analysis_records.append({
-                    "word": word,
-                    "true_label": true_label,
-                    "predicted_label": predicted_label,
-                    "error_type": error_type,
-                    "pos_tag": sentence_data["pos_tags"][i],
-                    "fgpos_tag": sentence_data["fgpos_tags"][i],
-                    "sentence": full_sentence,
-                })
-                
-                # Move to the next prediction
-                prediction_idx += 1
+    predictions = np.array(final_predictions)                 # [num_sents, max_len]
+    labels = np.array(tokenized_test_dataset["labels"])       # [num_sents, max_len]
 
-    # Create and save the DataFrame
+    # Basic shape sanity
+    if predictions.shape != labels.shape:
+        raise ValueError(f"Shape mismatch: predictions {predictions.shape} vs labels {labels.shape}")
+
+    for sent_idx, sentence_data in enumerate(original_test_data):
+        # Exact sentence text as it appeared in the JSONL
+        full_sentence = sentence_data.get(
+            "original_sentence",
+            " ".join(sentence_data["sentence_words"])
+        )
+
+        pred_sentence = predictions[sent_idx]
+        label_sentence = labels[sent_idx]
+
+        # First-token positions (where you placed gold labels during alignment)
+        first_token_positions = np.where(np.array(label_sentence) != -100)[0]
+
+        # If the model truncated, limit to available words
+        n_words = min(len(first_token_positions), len(sentence_data["sentence_words"]))
+
+        # Optional safety: skip pathologically short/long mismatches
+        if n_words == 0:
+            continue
+
+        for j in range(n_words):
+            tok_pos = first_token_positions[j]
+            word = sentence_data["sentence_words"][j]
+            true_label = int(label_sentence[tok_pos])
+            predicted_label = int(pred_sentence[tok_pos])
+
+            error_type = "Correct"
+            if predicted_label != true_label:
+                error_type = "False Positive" if predicted_label == 1 else "False Negative"
+
+            analysis_records.append({
+                "word": word,
+                "true_label": true_label,
+                "predicted_label": predicted_label,
+                "error_type": error_type,
+                "pos_tag": sentence_data["pos_tags"][j],
+                "fgpos_tag": sentence_data["fgpos_tags"][j],
+                "sentence": full_sentence,
+            })
+
     df = pd.DataFrame(analysis_records)
-    df.to_csv(output_file, index=False, encoding='utf-8')
+    df.to_csv(output_file, index=False, encoding="utf-8")
     print("Error analysis file generated successfully.")
+
 
 # --- Main Function ---
 
@@ -483,6 +516,7 @@ def main(args):
 
     train_data = load_and_group_data_pandas(os.path.join(args.data_dir, "vua20_metaphor_train.json"))
     test_data = load_and_group_data_pandas(os.path.join(args.data_dir, "vua20_metaphor_test.json"))
+    
 
     # --- Create Vocabularies ---
     all_pos_tags = sorted(list(set(tag for item in train_data for tag in item['pos_tags']).union(set(tag for item in test_data for tag in item['pos_tags']))))
@@ -503,10 +537,51 @@ def main(args):
     tokenized_train_dict = tokenize_and_align_labels(train_data_dict, tokenizer, pos2id, fgpos2id)
     tokenized_test_dict = tokenize_and_align_labels(test_data_dict, tokenizer, pos2id, fgpos2id)
 
+    # After building tokenized_test_dataset
+    expected_words = sum(len(x) for x in test_data_dict["sentence_words"])
+    observed_words = int((np.array(tokenized_test_dict["labels"]) != -100).sum())
+    print("Words in test_data vs. first-token labels:", expected_words, observed_words)
+
+
     # Create Hugging Face Dataset objects from the in-memory dictionaries
     # The columns are already aligned, so no need to remove any.
     tokenized_train_dataset = Dataset.from_dict(tokenized_train_dict)
     tokenized_test_dataset = Dataset.from_dict(tokenized_test_dict)
+
+    def sanity_check_samples(data, n=3):
+        print("\n--- Sanity Check: Sample Sentences ---")
+        for i, sample in enumerate(data[:n]):
+            print(f"\nSentence {i+1}: {sample.get('original_sentence', ' '.join(sample['sentence_words']))}")
+            print("Tokens : ", sample["sentence_words"])
+            print("Labels : ", sample["labels"])
+            print("POS    : ", sample["pos_tags"])
+            print("FGPOS  : ", sample["fgpos_tags"])
+            # Quick consistency checks
+            assert len(sample["sentence_words"]) == len(sample["labels"]) == len(sample["pos_tags"]) == len(sample["fgpos_tags"]), \
+                "Length mismatch detected!"
+        print("\nSanity check passed for first", n, "examples (no mismatches).")
+    # sanity_check_samples(train_data, n=100)
+
+    def sanity_check_tokenized(original_data, tokenized_dataset, n=3):
+        """
+        Checks alignment after tokenization.
+        Confirms number of non -100 labels == number of words per sentence (unless truncated).
+        """
+        print("\n--- Sanity Check: Tokenized Samples (Post-tokenization) ---")
+        labels = np.array(tokenized_dataset["labels"])
+        for i, sample in enumerate(original_data[:n]):
+            num_words = len(sample["sentence_words"])
+            num_labels = int((labels[i] != -100).sum())
+            print(f"Sentence {i+1}:")
+            print("  Words in original   :", num_words)
+            print("  Non -100 labels     :", num_labels)
+            if num_words != num_labels:
+                print("  ⚠️ Mismatch! (likely due to truncation at max_length)")
+            else:
+                print("  ✅ Match")
+        print("Post-tokenization sanity check done.\n")
+    # sanity_check_tokenized(train_data, tokenized_train_dataset, n=100)
+
     
     print("Tokenizing complete. Data is now fully processed in memory.")
 
